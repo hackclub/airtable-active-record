@@ -270,17 +270,69 @@ function getTable(table) {
   return activeData.find(t => t.name === table || t.id === table);
 }
 
-// Function to get records from a table with optional field filtering
+// Function to get records from a table with optional field filtering and field-based search
 // Automatically redacts fields with "redacted" in the name
-function get(table, fields = []) {
+function get(table, fields = [], filters = {}) {
   const tableData = getTable(table);
   
   if (!tableData) {
     return null;
   }
   
-  // Redact and filter records
-  let records = tableData.records.map(record => redactFields(record));
+  // Start with all records
+  let records = [...tableData.records];
+  
+  // Apply field-based filters (secure exact match only)
+  if (filters && typeof filters === 'object' && Object.keys(filters).length > 0) {
+    records = records.filter(record => {
+      // Check each filter - must match exactly (case-sensitive for security)
+      return Object.entries(filters).every(([fieldName, fieldValue]) => {
+        // Field name should already be sanitized, but double-check
+        if (!fieldName || typeof fieldName !== 'string') {
+          return false; // Invalid field name, reject
+        }
+        
+        // Check if field exists in record (case-sensitive)
+        if (!record.hasOwnProperty(fieldName)) {
+          return false;
+        }
+        
+        // Exact match only (no partial matching, no regex, no injection)
+        const recordValue = record[fieldName];
+        
+        // Handle different types safely
+        if (fieldValue === null || fieldValue === undefined) {
+          return recordValue === null || recordValue === undefined;
+        }
+        
+        // String comparison (exact match, case-sensitive)
+        if (typeof fieldValue === 'string') {
+          return typeof recordValue === 'string' && String(recordValue) === String(fieldValue);
+        }
+        
+        // Number comparison (exact match)
+        if (typeof fieldValue === 'number') {
+          return typeof recordValue === 'number' && Number(recordValue) === Number(fieldValue);
+        }
+        
+        // Boolean comparison (exact match)
+        if (typeof fieldValue === 'boolean') {
+          return typeof recordValue === 'boolean' && Boolean(recordValue) === Boolean(fieldValue);
+        }
+        
+        // For arrays, check if value is in array (exact match)
+        if (Array.isArray(recordValue)) {
+          return recordValue.includes(fieldValue);
+        }
+        
+        // Default: strict equality (convert both to strings for comparison)
+        return String(recordValue) === String(fieldValue);
+      });
+    });
+  }
+  
+  // Redact fields
+  records = records.map(record => redactFields(record));
   
   // If fields specified, filter to only those fields
   if (fields && fields.length > 0) {
@@ -332,11 +384,11 @@ async function getAllRecordsFromTable(tableId, token) {
 }
 
 // Function to fetch all tables and their data (uses env token for initial load)
-async function loadAirtableData() {
+async function loadAirtableData(token = null) {
   try {
-    const initialToken = process.env.airtable_pat;
-    if (!initialToken) {
-      console.warn('Warning: No Airtable token in environment. API will require token in requests.');
+    const syncToken = token || process.env.airtable_pat;
+    if (!syncToken) {
+      console.warn('Warning: No Airtable token provided. API will require token in requests.');
       return;
     }
 
@@ -345,7 +397,7 @@ async function loadAirtableData() {
     // Get all tables in the base
     const tablesResponse = await axios.get(
       `https://api.airtable.com/v0/meta/bases/${AIRTABLE_BASE_ID}/tables`,
-      { headers: getAuthHeaders(initialToken) }
+      { headers: getAuthHeaders(syncToken) }
     );
 
     const tables = tablesResponse.data.tables;
@@ -355,7 +407,7 @@ async function loadAirtableData() {
     activeData = await Promise.all(
       tables.map(async (table) => {
         console.log(`Fetching records from table: ${table.name} (${table.id})`);
-        const records = await getAllRecordsFromTable(table.id, initialToken);
+        const records = await getAllRecordsFromTable(table.id, syncToken);
         console.log(`  - Fetched ${records.length} records`);
         
         return {
@@ -371,8 +423,59 @@ async function loadAirtableData() {
   } catch (error) {
     console.error('Error loading Airtable data:', error.response?.data || error.message);
     // Don't throw - allow server to start even if initial load fails
-    console.warn('Server will start but initial data load failed. Use API endpoints with token to load data.');
+    if (!token) {
+      console.warn('Server will start but initial data load failed. Use API endpoints with token to load data.');
+    } else {
+      throw error; // Re-throw for background sync so it can retry
+    }
   }
+}
+
+// Background sync function - syncs all tables every 10 minutes
+async function startBackgroundSync() {
+  const SYNC_INTERVAL = 10 * 60 * 1000; // 10 minutes in milliseconds
+  
+  async function performSync() {
+    try {
+      // Wait for queue to be empty
+      console.log('Background sync: Waiting for queue to be empty...');
+      let waitCount = 0;
+      const maxWait = 60; // Wait up to 60 iterations (5 minutes max)
+      
+      while ((queue.length > 0 || isProcessingQueue) && waitCount < maxWait) {
+        await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+        waitCount++;
+        if (waitCount % 6 === 0) {
+          console.log(`Background sync: Still waiting... (queue: ${queue.length}, processing: ${isProcessingQueue})`);
+        }
+      }
+      
+      if (queue.length > 0 || isProcessingQueue) {
+        console.warn('Background sync: Queue not empty after max wait time, skipping sync');
+        return;
+      }
+      
+      // Get token from environment (for background sync)
+      const syncToken = process.env.airtable_pat;
+      if (!syncToken) {
+        console.warn('Background sync: No token available, skipping sync');
+        return;
+      }
+      
+      console.log('Background sync: Starting sync of all tables...');
+      await loadAirtableData(syncToken);
+      console.log('Background sync: Completed successfully');
+    } catch (error) {
+      console.error('Background sync: Error during sync:', error.response?.data || error.message);
+    }
+    
+    // Schedule next sync
+    setTimeout(performSync, SYNC_INTERVAL);
+  }
+  
+  // Start first sync after 10 minutes
+  console.log(`Background sync: Will start in 10 minutes, then sync every 10 minutes`);
+  setTimeout(performSync, SYNC_INTERVAL);
 }
 
 // Root endpoint - returns comprehensive API documentation
@@ -401,7 +504,7 @@ app.get('/', (req, res) => {
       },
 
       "GET /get": {
-        description: "Retrieve records from a table with optional field filtering",
+        description: "Retrieve records from a table with optional field filtering and field-based search",
         authentication: true,
         parameters: {
           table: {
@@ -420,22 +523,37 @@ app.get('/', (req, res) => {
             type: "string (query parameter)",
             required: true,
             description: "Airtable Personal Access Token"
+          },
+          "any_field_name": {
+            type: "string, number, or boolean (query parameter)",
+            required: false,
+            description: "Filter records by any field. Use exact field name as parameter name and desired value. Supports exact match only (secure, no injection attacks). Multiple filters are ANDed together.",
+            examples: [
+              "Name=Thomas - returns records where Name exactly equals 'Thomas'",
+              "Token=39i1290fjzefijo - returns records where Token field equals '39i1290fjzefijo'",
+              "Status=Active&Age=25 - returns records where Status is 'Active' AND Age is 25"
+            ]
           }
         },
         response: {
           type: "array of objects",
-          description: "Array of records. Each record includes 'id' field plus requested fields. Fields with 'redacted' in name are automatically redacted.",
+          description: "Array of records matching the filters. Each record includes 'id' field plus requested fields. Fields with 'redacted' in name are automatically redacted.",
           example: [
             {
               "id": "recXXXXXXXXXXXXXX",
-              "Name": "John Doe",
-              "Email": "john@example.com",
+              "Name": "Thomas",
+              "Email": "thomas@example.com",
               "address-redacted": "redacted"
             }
           ]
         },
-        example_request: "curl 'http://localhost:3000/get?table=Signups&token=your_token&fields=Name,Email'",
-        example_request_all_fields: "curl 'http://localhost:3000/get?table=Signups&token=your_token'"
+        example_requests: [
+          "curl 'http://localhost:3000/get?table=Signups&token=your_token&fields=Name,Email'",
+          "curl 'http://localhost:3000/get?table=Signups&token=your_token&Name=Thomas'",
+          "curl 'http://localhost:3000/get?table=Signups&token=your_token&Token=39i1290fjzefijo'",
+          "curl 'http://localhost:3000/get?table=Signups&token=your_token&Name=Thomas&Status=Active'"
+        ],
+        security_note: "All filter values are sanitized and only exact matches are performed. No partial matching, regex, or injection attacks possible."
       },
 
       "POST /create": {
@@ -680,10 +798,10 @@ app.get('/', (req, res) => {
   });
 });
 
-// GET endpoint - get records from a table with optional field filtering
+// GET endpoint - get records from a table with optional field filtering and field-based search
 app.get('/get', authenticateToken, (req, res) => {
   try {
-    const { table, fields } = req.query;
+    const { table, fields, ...queryParams } = req.query;
     const airtableToken = req.airtableToken;
 
     // Sanitize inputs
@@ -692,7 +810,7 @@ app.get('/get', authenticateToken, (req, res) => {
       return res.status(400).json({ error: 'Table is required and must be a valid string' });
     }
 
-    // Parse fields if provided (comma-separated or array)
+    // Parse fields if provided (comma-separated or array) - these are fields to RETURN
     let fieldArray = [];
     if (fields) {
       if (typeof fields === 'string') {
@@ -702,8 +820,59 @@ app.get('/get', authenticateToken, (req, res) => {
       }
     }
 
-    // Get records using the get() function (automatically redacts fields)
-    const records = get(sanitizedTable, fieldArray.length > 0 ? fieldArray : []);
+    // Parse filter parameters - any query param except 'table', 'fields', and 'token' is treated as a filter
+    const filters = {};
+    for (const [key, value] of Object.entries(queryParams)) {
+      // Skip known parameters
+      if (key === 'token' || key === 'table' || key === 'fields') {
+        continue;
+      }
+      
+      // Sanitize field name (but be less strict - allow most characters for field names)
+      // Field names can have spaces, hyphens, underscores, etc.
+      let sanitizedKey = key.trim();
+      // Only remove truly dangerous characters, keep field name structure
+      sanitizedKey = sanitizedKey.replace(/[<>{}[\]\\\/]/g, '');
+      
+      if (!sanitizedKey || sanitizedKey.length === 0) {
+        continue; // Invalid field name, skip
+      }
+      
+      // Sanitize and parse value
+      if (value !== undefined && value !== null && value !== '') {
+        // Try to parse as number or boolean, otherwise keep as string
+        let parsedValue = value;
+        if (typeof value === 'string') {
+          // Try number
+          if (/^-?\d+\.?\d*$/.test(value.trim())) {
+            parsedValue = value.includes('.') ? parseFloat(value) : parseInt(value, 10);
+          }
+          // Try boolean
+          else if (value.toLowerCase().trim() === 'true') {
+            parsedValue = true;
+          }
+          else if (value.toLowerCase().trim() === 'false') {
+            parsedValue = false;
+          }
+          // Keep as string (trimmed, but don't over-sanitize - preserve the value)
+          else {
+            parsedValue = value.trim();
+          }
+        }
+        
+        if (parsedValue !== undefined && parsedValue !== null && parsedValue !== '') {
+          filters[sanitizedKey] = parsedValue;
+        }
+      }
+    }
+
+    // Debug logging (can be removed later)
+    if (Object.keys(filters).length > 0) {
+      console.log('Applied filters:', filters);
+    }
+
+    // Get records using the get() function (automatically redacts fields and applies filters)
+    const records = get(sanitizedTable, fieldArray.length > 0 ? fieldArray : [], filters);
 
     if (records === null) {
       return res.status(404).json({ error: `Table "${sanitizedTable}" not found` });
@@ -940,6 +1109,9 @@ async function startServer() {
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Visit http://localhost:${PORT}/ to see your Airtable data`);
+      
+      // Start background sync
+      startBackgroundSync();
     });
   } catch (error) {
     console.error('Failed to start server:', error.message);
