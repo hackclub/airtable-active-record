@@ -4,11 +4,11 @@ A high-performance, secure Express.js API for interacting with Airtable data wit
 
 ## Features
 
-- ⚡ **Instant Responses**: All write operations return in <10ms using optimistic updates
-- 🔒 **Secure**: Token-based authentication, input sanitization, and automatic field redaction
-- 🚀 **Background Processing**: Airtable API calls are queued and processed asynchronously
-- 📊 **In-Memory Cache**: All data is loaded on startup and kept in sync
-- 🔄 **Automatic Rollback**: Failed operations are automatically rolled back
+- **Instant Responses**: All write operations return in <10ms using optimistic updates
+- **Secure**: Token-based authentication, input sanitization, and automatic field redaction
+- **Background Processing**: Airtable API calls are queued and processed asynchronously
+- **In-Memory Cache**: All data is loaded on startup and kept in sync
+- **Automatic Rollback**: Failed operations are automatically rolled back
 
 ## Installation
 
