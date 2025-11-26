@@ -134,12 +134,86 @@ let activeData = [];
 const queue = [];
 let isProcessingQueue = false;
 
+// Rate limiting system for Airtable API
+// Airtable allows 5 requests per second per base
+const RATE_LIMIT_REQUESTS_PER_SECOND = 5;
+const RATE_LIMIT_WINDOW_MS = 1000; // 1 second window
+
+// Track request timestamps for rate limiting
+const requestTimestamps = [];
+
+// Track consecutive rate limit errors for adaptive backoff
+let consecutiveRateLimitErrors = 0;
+let lastRateLimitErrorTime = 0;
+const MAX_BACKOFF_MS = 30000; // Max 30 seconds backoff
+
+// Wait to respect rate limits
+async function waitForRateLimit() {
+  const now = Date.now();
+  
+  // Remove timestamps older than 1 second
+  while (requestTimestamps.length > 0 && now - requestTimestamps[0] > RATE_LIMIT_WINDOW_MS) {
+    requestTimestamps.shift();
+  }
+  
+  // If we've hit the rate limit, wait
+  if (requestTimestamps.length >= RATE_LIMIT_REQUESTS_PER_SECOND) {
+    const oldestRequest = requestTimestamps[0];
+    const waitTime = RATE_LIMIT_WINDOW_MS - (now - oldestRequest) + 10; // Add 10ms buffer
+    
+    if (waitTime > 0) {
+      console.log(`Rate limit: Waiting ${waitTime}ms (${requestTimestamps.length}/${RATE_LIMIT_REQUESTS_PER_SECOND} requests in window)`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      // Clean up again after waiting
+      const newNow = Date.now();
+      while (requestTimestamps.length > 0 && newNow - requestTimestamps[0] > RATE_LIMIT_WINDOW_MS) {
+        requestTimestamps.shift();
+      }
+    }
+  }
+  
+  // Add adaptive backoff if we've been hitting rate limits
+  if (consecutiveRateLimitErrors > 0) {
+    const timeSinceLastError = now - lastRateLimitErrorTime;
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
+    const backoffTime = Math.min(
+      Math.pow(2, consecutiveRateLimitErrors - 1) * 1000,
+      MAX_BACKOFF_MS
+    );
+    
+    if (timeSinceLastError < backoffTime) {
+      const remainingBackoff = backoffTime - timeSinceLastError;
+      console.log(`Adaptive backoff: Waiting ${remainingBackoff}ms (${consecutiveRateLimitErrors} consecutive rate limit errors)`);
+      await new Promise(resolve => setTimeout(resolve, remainingBackoff));
+    }
+  }
+  
+  // Record this request timestamp
+  requestTimestamps.push(Date.now());
+}
+
+// Handle rate limit errors with exponential backoff
+function handleRateLimitError() {
+  consecutiveRateLimitErrors++;
+  lastRateLimitErrorTime = Date.now();
+  console.warn(`Rate limit hit! Consecutive errors: ${consecutiveRateLimitErrors}`);
+}
+
+// Reset rate limit error counter on successful request
+function resetRateLimitErrors() {
+  if (consecutiveRateLimitErrors > 0) {
+    console.log(`Rate limit recovered after ${consecutiveRateLimitErrors} errors`);
+    consecutiveRateLimitErrors = 0;
+    lastRateLimitErrorTime = 0;
+  }
+}
+
 // Generate temporary ID for optimistic updates
 function generateTempId() {
   return `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
 
-// Process queue in background
+// Process queue in background with rate limiting
 async function processQueue() {
   if (isProcessingQueue || queue.length === 0) {
     return;
@@ -151,12 +225,47 @@ async function processQueue() {
   while (queue.length > 0) {
     const job = queue.shift();
     try {
+      // Wait to respect rate limits before making request
+      await waitForRateLimit();
+      
+      // Execute the operation
       await executeAirtableOperation(job);
+      
+      // Reset rate limit error counter on success
+      resetRateLimitErrors();
+      
       console.log(`✓ Queue job completed: ${job.type} ${job.recordId || job.tempId || ''}`);
     } catch (error) {
-      console.error(`✗ Queue job failed: ${job.type}`, error.response?.data || error.message);
-      // Handle rollback for failed operations
-      await rollbackOperation(job);
+      // Check if it's a rate limit error (429)
+      if (error.response?.status === 429) {
+        handleRateLimitError();
+        
+        // Check for Retry-After header
+        const retryAfter = error.response?.headers['retry-after'] || 
+                          error.response?.headers['Retry-After'];
+        
+        if (retryAfter) {
+          const waitSeconds = parseInt(retryAfter, 10);
+          console.log(`Rate limited: Waiting ${waitSeconds} seconds (Retry-After header)`);
+          await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+        } else {
+          // Exponential backoff
+          const backoffTime = Math.min(
+            Math.pow(2, consecutiveRateLimitErrors - 1) * 1000,
+            MAX_BACKOFF_MS
+          );
+          console.log(`Rate limited: Waiting ${backoffTime}ms (exponential backoff)`);
+          await new Promise(resolve => setTimeout(resolve, backoffTime));
+        }
+        
+        // Re-queue the job to retry
+        queue.unshift(job);
+        console.log(`Re-queued job after rate limit: ${job.type}`);
+      } else {
+        // Other errors - handle rollback
+        console.error(`✗ Queue job failed: ${job.type}`, error.response?.data || error.message);
+        await rollbackOperation(job);
+      }
     }
   }
 
@@ -351,24 +460,63 @@ function get(table, fields = [], filters = {}) {
 }
 
 
-// Function to get all records from a table with pagination
+// Function to get all records from a table with pagination (respects rate limits)
 async function getAllRecordsFromTable(tableId, token) {
   const records = [];
   let offset = null;
 
-  do {
+  while (true) {
+    // Wait to respect rate limits before making request
+    await waitForRateLimit();
+    
     const params = { pageSize: 100 };
     if (offset) {
       params.offset = offset;
     }
 
-    const response = await axios.get(
-      `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}`,
-      {
-        headers: getAuthHeaders(token),
-        params
+    let response;
+    let shouldRetry = false;
+    
+    try {
+      response = await axios.get(
+        `https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${tableId}`,
+        {
+          headers: getAuthHeaders(token),
+          params
+        }
+      );
+      resetRateLimitErrors();
+    } catch (error) {
+      if (error.response?.status === 429) {
+        handleRateLimitError();
+        const retryAfter = error.response?.headers['retry-after'] || 
+                          error.response?.headers['Retry-After'];
+        if (retryAfter) {
+          const waitSeconds = parseInt(retryAfter, 10);
+          console.log(`Rate limited during sync: Waiting ${waitSeconds} seconds`);
+          await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
+        } else {
+          const backoffTime = Math.min(
+            Math.pow(2, consecutiveRateLimitErrors - 1) * 1000,
+            MAX_BACKOFF_MS
+          );
+          console.log(`Rate limited during sync: Waiting ${backoffTime}ms`);
+          await new Promise(resolve => setTimeout(resolve, backoffTime));
+        }
+        // Retry the request
+        shouldRetry = true;
+      } else {
+        throw error;
       }
-    );
+    }
+    
+    if (shouldRetry) {
+      continue; // Retry the same request
+    }
+    
+    if (!response) {
+      break; // Should not happen, but safety check
+    }
 
     // Transform records: merge id into fields and flatten
     const transformedRecords = response.data.records.map(record => ({
@@ -378,7 +526,12 @@ async function getAllRecordsFromTable(tableId, token) {
 
     records.push(...transformedRecords);
     offset = response.data.offset || null;
-  } while (offset);
+    
+    // Break if no more pages
+    if (!offset) {
+      break;
+    }
+  }
 
   return records;
 }
@@ -890,9 +1043,20 @@ app.get('/get', authenticateToken, (req, res) => {
 
 // Endpoint to check queue status (requires authentication)
 app.get('/queue-status', authenticateToken, (req, res) => {
+  const now = Date.now();
+  // Calculate current requests in the last second
+  const recentRequests = requestTimestamps.filter(ts => now - ts < RATE_LIMIT_WINDOW_MS).length;
+  
   res.json({
     queueLength: queue.length,
-    isProcessing: isProcessingQueue
+    isProcessing: isProcessingQueue,
+    rateLimit: {
+      limit: RATE_LIMIT_REQUESTS_PER_SECOND,
+      current: recentRequests,
+      remaining: Math.max(0, RATE_LIMIT_REQUESTS_PER_SECOND - recentRequests),
+      consecutiveErrors: consecutiveRateLimitErrors,
+      lastErrorTime: lastRateLimitErrorTime > 0 ? new Date(lastRateLimitErrorTime).toISOString() : null
+    }
   });
 });
 
