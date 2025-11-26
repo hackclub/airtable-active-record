@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 
 // Airtable configuration
-const AIRTABLE_BASE_ID = 'apphFT63p1KWuTrGO';
+const AIRTABLE_BASE_ID = process.env.base_id || 'apphFT63p1KWuTrGO';
 
 // Authentication middleware - require token in request
 function authenticateToken(req, res, next) {

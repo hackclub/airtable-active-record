@@ -20,6 +20,7 @@ A high-performance, secure Express.js API for interacting with Airtable data wit
 
 3. Create a `.env` file (optional - for initial data load):
    ```env
+   base_id=your_airtable_base_id
    airtable_pat=your_airtable_personal_access_token
    PORT=3000
    ```
@@ -150,6 +151,7 @@ docker run -p 3000:3000 \
    - Coolify will automatically detect the Dockerfile
 
 3. **Set Environment Variables** in Coolify:
+   - `base_id=your_airtable_base_id` (required)
    - `PORT=3000` (Coolify will set this automatically, but you can override)
    - `airtable_pat=your_airtable_personal_access_token` (optional, for initial data load)
 
@@ -171,7 +173,12 @@ The API will be available at your Coolify domain. The server will automatically 
 
 ## Configuration
 
-The Airtable base ID is configured in `server.js`. Update `AIRTABLE_BASE_ID` to point to your base.
+The Airtable base ID can be configured via the `base_id` environment variable. If not set, it defaults to the hardcoded value in `server.js`.
+
+**Environment Variables:**
+- `base_id` - Your Airtable base ID (required)
+- `airtable_pat` - Airtable Personal Access Token (optional, for initial data load)
+- `PORT` - Server port (defaults to 3000)
 
 ## License
 
