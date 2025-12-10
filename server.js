@@ -31,6 +31,7 @@ function authenticateToken(req, res, next) {
 }
 
 // Input sanitization - prevent injection attacks
+// Used for table names, field names, and other identifiers
 function sanitizeInput(input) {
   if (typeof input !== 'string') {
     return input;
@@ -39,6 +40,23 @@ function sanitizeInput(input) {
   // Remove any characters that could be used for injection
   // Allow alphanumeric, spaces, hyphens, underscores, and basic punctuation
   return input.replace(/[^a-zA-Z0-9\s\-_.,!?@#$%&*()]/g, '').trim();
+}
+
+// Sanitize field values - less restrictive to allow URLs, paths, etc.
+// Field values are JSON-encoded when sent to Airtable, so forward slashes are safe
+function sanitizeFieldValue(input) {
+  if (typeof input !== 'string') {
+    return input;
+  }
+  
+  // Allow URLs, paths, and common characters while blocking only truly dangerous ones
+  // Block: null bytes, control characters (except newlines/tabs), and potential script tags
+  return input
+    .replace(/\0/g, '') // Remove null bytes
+    .replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '') // Remove control chars except \n, \r, \t
+    .replace(/<script/gi, '&lt;script') // Escape script tags as a precaution
+    .replace(/<\/script>/gi, '&lt;/script&gt;')
+    .trim();
 }
 
 // Sanitize table name
@@ -70,13 +88,14 @@ function sanitizeFields(fields) {
     const sanitizedKey = sanitizeInput(key);
     if (sanitizedKey) {
       // Sanitize value based on type
+      // Use sanitizeFieldValue for values to allow URLs/paths (forward slashes, colons, etc.)
       if (typeof value === 'string') {
-        sanitized[sanitizedKey] = sanitizeInput(value);
+        sanitized[sanitizedKey] = sanitizeFieldValue(value);
       } else if (typeof value === 'number' || typeof value === 'boolean' || value === null) {
         sanitized[sanitizedKey] = value;
       } else if (Array.isArray(value)) {
         sanitized[sanitizedKey] = value.map(item => 
-          typeof item === 'string' ? sanitizeInput(item) : item
+          typeof item === 'string' ? sanitizeFieldValue(item) : item
         );
       } else {
         sanitized[sanitizedKey] = value;
