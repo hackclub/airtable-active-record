@@ -1258,6 +1258,23 @@ app.delete('/delete', authenticateToken, async (req, res) => {
   }
 });
 
+// Global error handling middleware (must be after all routes)
+app.use((err, req, res, next) => {
+  console.error('Express error handler:', err);
+  console.error('Stack:', err.stack);
+  if (!res.headersSent) {
+    res.status(err.status || 500).json({
+      error: err.message || 'Internal server error',
+      ...(process.env.NODE_ENV === 'development' && { stack: err.stack })
+    });
+  }
+});
+
+// 404 handler for undefined routes
+app.use((req, res) => {
+  res.status(404).json({ error: 'Endpoint not found' });
+});
+
 // Export functions for use
 module.exports = {
   get,
@@ -1265,21 +1282,71 @@ module.exports = {
   activeData
 };
 
+// Handle uncaught exceptions and unhandled rejections to prevent crashes
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  console.error('Stack:', error.stack);
+  // Don't exit immediately - give time for graceful shutdown
+  setTimeout(() => {
+    console.error('Exiting due to uncaught exception...');
+    process.exit(1);
+  }, 1000);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise);
+  console.error('Reason:', reason);
+  // Log but don't exit - these are often recoverable
+  console.error('Continuing despite unhandled rejection...');
+});
+
+// Handle SIGTERM and SIGINT for graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received, shutting down gracefully...');
+  process.exit(0);
+});
+
 // Start server and load data
 async function startServer() {
   try {
     await loadAirtableData();
     
-    app.listen(PORT, () => {
+    const server = app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
       console.log(`Visit http://localhost:${PORT}/ to see your Airtable data`);
       
       // Start background sync
       startBackgroundSync();
     });
+
+    // Handle server errors gracefully
+    server.on('error', (error) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(`Port ${PORT} is already in use`);
+        process.exit(1);
+      } else {
+        console.error('Server error:', error);
+        // Don't exit - let it try to recover
+      }
+    });
+
+    // Keep-alive timeout handling
+    server.keepAliveTimeout = 65000; // 65 seconds
+    server.headersTimeout = 66000; // 66 seconds
+
   } catch (error) {
     console.error('Failed to start server:', error.message);
-    process.exit(1);
+    console.error('Stack:', error.stack);
+    // Retry after a delay
+    console.log('Retrying in 5 seconds...');
+    setTimeout(() => {
+      startServer();
+    }, 5000);
   }
 }
 

@@ -135,6 +135,7 @@ docker build -t airtable-active-record .
 
 # Run the container
 docker run -p 3000:3000 \
+  -e base_id=your_airtable_base_id \
   -e PORT=3000 \
   -e airtable_pat=your_airtable_personal_access_token \
   airtable-active-record
